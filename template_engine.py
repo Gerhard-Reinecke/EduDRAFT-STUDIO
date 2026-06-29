@@ -12003,6 +12003,39 @@ def render_blueprint_to_docx(blueprint: Dict[str, Any], template_profile: Dict[s
     doc = Document()
 
     # --------------------------------------------------
+    # Apply dominant font from template_profile to Normal style
+    # --------------------------------------------------
+    try:
+        from docx.shared import Pt
+        from collections import Counter
+
+        style_prefs = template_profile.get("style_preferences", {}) or {}
+        font_samples = template_profile.get("font_samples", []) or []
+
+        font_name = style_prefs.get("font_name") or style_prefs.get("font_family")
+        font_size = style_prefs.get("font_size_pt") or style_prefs.get("font_size")
+
+        if not font_name and font_samples:
+            names = [s.get("name") for s in font_samples if s.get("name")]
+            if names:
+                font_name = Counter(names).most_common(1)[0][0]
+
+        if not font_size and font_samples:
+            sizes = [s.get("size_pt") for s in font_samples if s.get("size_pt")]
+            if sizes:
+                font_size = Counter(sizes).most_common(1)[0][0]
+
+        normal_style = doc.styles["Normal"]
+        if font_name:
+            normal_style.font.name = font_name
+            logger.info(f"RENDERER: Applied Normal font name: {font_name}")
+        if font_size:
+            normal_style.font.size = Pt(float(font_size))
+            logger.info(f"RENDERER: Applied Normal font size: {font_size}pt")
+    except Exception as e:
+        logger.warning(f"RENDERER: Could not apply Normal style font (non-fatal): {e}")
+
+    # --------------------------------------------------
     # Page setup from blueprint contract surface first
     # --------------------------------------------------
     appropriateness_decisions = blueprint.get("appropriateness_decisions", {}) or {}
@@ -12285,28 +12318,73 @@ def _apply_logo_to_output(output_doc, logo_data: ExtractedImage) -> None:
     if not logo_data or not logo_data.binary_data:
         logger.warning("No logo data to apply")
         return
-    
+
     try:
-        from docx.shared import Inches
+        from docx.shared import Inches, Pt
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
         from io import BytesIO
-        
-        # Create a temporary file from binary data
+
         temp_logo = BytesIO(logo_data.binary_data)
-        
-        # Add to header or body based on position
-        if logo_data.position == "header" and output_doc.sections:
+
+        raw_width = logo_data.width_inches if logo_data.width_inches else 1.5
+        logo_width = max(0.5, min(2.5, raw_width))
+
+        in_header_table = getattr(logo_data, "in_header_table", False)
+        institution_name = getattr(logo_data, "institution_name", None)
+
+        if in_header_table and institution_name and output_doc.sections:
+            header = output_doc.sections[0].header
+            # Clear existing header paragraphs
+            for para in header.paragraphs:
+                para.clear()
+
+            table = header.add_table(rows=1, cols=2, width=Inches(6.5))
+            table.style = "Table Grid"
+            # Remove borders
+            tbl = table._tbl
+            tbl_pr = tbl.find(qn("w:tblPr"))
+            if tbl_pr is None:
+                tbl_pr = OxmlElement("w:tblPr")
+                tbl.insert(0, tbl_pr)
+            tbl_borders = OxmlElement("w:tblBorders")
+            for border_name in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                border_el = OxmlElement(f"w:{border_name}")
+                border_el.set(qn("w:val"), "none")
+                tbl_borders.append(border_el)
+            tbl_pr.append(tbl_borders)
+
+            left_cell = table.cell(0, 0)
+            temp_logo.seek(0)
+            left_run = left_cell.paragraphs[0].add_run()
+            left_run.add_picture(temp_logo, width=Inches(logo_width))
+
+            right_cell = table.cell(0, 1)
+            right_para = right_cell.paragraphs[0]
+            right_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+            right_run = right_para.add_run(institution_name)
+            right_run.bold = True
+            right_run.font.size = Pt(11)
+
+            logger.info("Applied logo + institution name as borderless header table")
+
+        elif logo_data.position == "header" and output_doc.sections:
             header = output_doc.sections[0].header
             paragraph = header.paragraphs[0] if header.paragraphs else header.add_paragraph()
             run = paragraph.add_run()
-            run.add_picture(temp_logo, width=Inches(logo_data.width_inches))
+            temp_logo.seek(0)
+            run.add_picture(temp_logo, width=Inches(logo_width))
+            logger.info("Applied logo to header paragraph")
+
         else:
-            # Add to body
             paragraph = output_doc.add_paragraph()
             paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER if logo_data.alignment == "center" else WD_ALIGN_PARAGRAPH.LEFT
             run = paragraph.add_run()
-            run.add_picture(temp_logo, width=Inches(logo_data.width_inches))
-        
-        logger.info(f"Applied logo to {logo_data.position}")
+            temp_logo.seek(0)
+            run.add_picture(temp_logo, width=Inches(logo_width))
+            logger.info("Applied logo to body paragraph")
+
     except Exception as e:
         logger.warning(f"Failed to apply logo: {e}")
 
@@ -12876,26 +12954,53 @@ def _preserve_visual_slots_in_output(
 def _apply_run_properties_to_output(run, properties: Dict) -> None:
     """Apply exact run properties to output document run."""
     try:
-        from docx.shared import Pt
-        
+        from docx.shared import Pt, RGBColor
+
         if "name" in properties and properties["name"]:
             run.font.name = properties["name"]
-        
+
         if "size_pt" in properties and properties["size_pt"]:
             run.font.size = Pt(properties["size_pt"])
-        
-        if properties.get("bold"):
-            run.font.bold = True
-        
-        if properties.get("italic"):
-            run.font.italic = True
-        
-        if properties.get("underline"):
-            run.font.underline = True
-        
+
+        run.font.bold = bool(properties.get("bold"))
+        run.font.italic = bool(properties.get("italic"))
+        run.font.underline = bool(properties.get("underline"))
+
+        color = properties.get("color")
+        if color and isinstance(color, (list, tuple)) and len(color) == 3:
+            run.font.color.rgb = RGBColor(int(color[0]), int(color[1]), int(color[2]))
+
         logger.debug("Applied run properties to output")
     except Exception as e:
         logger.warning(f"Failed to apply run properties: {e}")
+
+
+def _apply_paragraph_properties_to_output(paragraph, style_preferences: Dict) -> None:
+    """Apply donor paragraph spacing and indent from style_preferences to an output paragraph."""
+    try:
+        from docx.shared import Pt, Inches
+
+        fmt = paragraph.paragraph_format
+
+        space_before = style_preferences.get("space_before_pt")
+        if space_before is not None:
+            fmt.space_before = Pt(space_before)
+
+        space_after = style_preferences.get("space_after_pt")
+        if space_after is not None:
+            fmt.space_after = Pt(space_after)
+
+        line_spacing = style_preferences.get("line_spacing_pt")
+        if line_spacing is not None:
+            fmt.line_spacing = Pt(line_spacing)
+
+        indent_left = style_preferences.get("indent_left_inches")
+        if indent_left is not None:
+            fmt.left_indent = Inches(indent_left)
+
+        logger.debug("Applied paragraph properties to output")
+    except Exception as e:
+        logger.warning(f"Failed to apply paragraph properties: {e}")
 
 
 # ======================================================================================
