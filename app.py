@@ -8522,7 +8522,8 @@ demo.launch(
     server_port=port,
     share=False,
     prevent_thread_lock=False,
-    show_error=True
+    show_error=True,
+    allowed_paths=["/app"]
 )
 
 
