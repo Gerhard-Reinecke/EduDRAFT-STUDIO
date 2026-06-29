@@ -8513,31 +8513,14 @@ with gr.Blocks(title="EduDRAFT STUDIO", css=CUSTOM_CSS) as demo:
     )
 
 
-import socket
+port = int(os.getenv("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
 
-preferred_port = int(os.getenv("GRADIO_SERVER_PORT", "7861"))
-fallback_ports = [preferred_port, 7862, 7863, 7864, 7865]
-
-def _port_is_free(port: int) -> bool:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        return s.connect_ex(("127.0.0.1", port)) != 0
-
-launch_port = None
-for port in fallback_ports:
-    if _port_is_free(port):
-        launch_port = port
-        break
-
-if launch_port is None:
-    raise OSError(f"No free Gradio port found in: {fallback_ports}")
-
-print(f"Launching Gradio on port {launch_port}")
+print(f"Launching Gradio on port {port}")
 
 demo.launch(
     server_name="0.0.0.0",
-    server_port=launch_port,
-    share=True,
+    server_port=port,
+    share=False,
     prevent_thread_lock=False
 )
 
