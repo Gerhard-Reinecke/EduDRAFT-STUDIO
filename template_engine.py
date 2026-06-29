@@ -919,6 +919,239 @@ def _validate_bundle(bundle: str) -> bool:
 
 
 
+
+
+# ======================================================================================
+# BS5 FIRST-PAGE LAYOUT CONTRACT HELPERS
+# ======================================================================================
+
+def _safe_len_value(value):
+    try:
+        return float(value.inches) if value is not None and hasattr(value, "inches") else None
+    except Exception:
+        return None
+
+def _extract_run_style_signature(run) -> Dict[str, Any]:
+    """Return a small, JSON-safe run style signature. Missing properties are omitted."""
+    sig: Dict[str, Any] = {}
+    try:
+        font = getattr(run, "font", None)
+        if font is not None:
+            if getattr(font, "name", None):
+                sig["font_name"] = font.name
+            if getattr(font, "size", None):
+                sig["font_size_pt"] = font.size.pt
+            for attr in ("bold", "italic", "underline"):
+                val = getattr(font, attr, None)
+                if val is not None:
+                    sig[attr] = bool(val)
+            try:
+                if font.color and font.color.rgb:
+                    sig["color_rgb"] = str(font.color.rgb)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    try:
+        if getattr(run, "style", None) and run.style.name:
+            sig["style_name"] = run.style.name
+    except Exception:
+        pass
+    return sig
+
+def _extract_paragraph_style_signature(paragraph) -> Dict[str, Any]:
+    """Return a conservative paragraph style signature plus dominant run style."""
+    sig: Dict[str, Any] = {}
+    try:
+        if getattr(paragraph, "style", None) and paragraph.style.name:
+            sig["style_name"] = paragraph.style.name
+    except Exception:
+        pass
+    try:
+        if getattr(paragraph, "alignment", None) is not None:
+            sig["alignment"] = paragraph.alignment.name
+    except Exception:
+        pass
+    try:
+        pf = paragraph.paragraph_format
+        for key, attr in (("space_before_pt", "space_before"), ("space_after_pt", "space_after"), ("left_indent_pt", "left_indent"), ("right_indent_pt", "right_indent"), ("first_line_indent_pt", "first_line_indent")):
+            val = getattr(pf, attr, None)
+            if val is not None:
+                sig[key] = val.pt
+        if pf.line_spacing is not None:
+            sig["line_spacing"] = pf.line_spacing
+    except Exception:
+        pass
+    try:
+        run_sigs = [_extract_run_style_signature(r) for r in paragraph.runs if getattr(r, "text", "").strip()]
+        run_sigs = [r for r in run_sigs if r]
+        if run_sigs:
+            # Prefer the first styled run; question headings often have one run.
+            sig["run"] = run_sigs[0]
+    except Exception:
+        pass
+    return sig
+
+def _apply_run_style_signature(target_run, signature: Dict[str, Any]) -> None:
+    """Apply a conservative run signature without disturbing text/math/numbering."""
+    if not signature:
+        return
+    try:
+        font = target_run.font
+        if signature.get("font_name"):
+            font.name = signature.get("font_name")
+        if signature.get("font_size_pt") is not None:
+            font.size = Pt(float(signature.get("font_size_pt")))
+        for attr in ("bold", "italic", "underline"):
+            if attr in signature:
+                setattr(font, attr, bool(signature[attr]))
+        if signature.get("color_rgb"):
+            from docx.shared import RGBColor
+            rgb = str(signature.get("color_rgb")).replace("#", "").strip()
+            if len(rgb) == 6:
+                font.color.rgb = RGBColor(int(rgb[0:2], 16), int(rgb[2:4], 16), int(rgb[4:6], 16))
+    except Exception as e:
+        logger.debug(f"Could not apply run signature: {e}")
+
+def _apply_paragraph_style_signature(target_paragraph, signature: Dict[str, Any]) -> None:
+    """Apply paragraph/run style signature defensively."""
+    if not signature:
+        return
+    try:
+        style_name = signature.get("style_name")
+        if style_name and style_name in [s.name for s in target_paragraph.part.document.styles]:
+            target_paragraph.style = style_name
+    except Exception:
+        pass
+    try:
+        from docx.enum.text import WD_ALIGN_PARAGRAPH
+        align_name = str(signature.get("alignment") or "").upper()
+        if align_name and hasattr(WD_ALIGN_PARAGRAPH, align_name):
+            target_paragraph.alignment = getattr(WD_ALIGN_PARAGRAPH, align_name)
+    except Exception:
+        pass
+    try:
+        pf = target_paragraph.paragraph_format
+        if signature.get("space_before_pt") is not None:
+            pf.space_before = Pt(float(signature["space_before_pt"]))
+        if signature.get("space_after_pt") is not None:
+            pf.space_after = Pt(float(signature["space_after_pt"]))
+        if signature.get("left_indent_pt") is not None:
+            pf.left_indent = Pt(float(signature["left_indent_pt"]))
+        if signature.get("first_line_indent_pt") is not None:
+            pf.first_line_indent = Pt(float(signature["first_line_indent_pt"]))
+        if signature.get("line_spacing") is not None:
+            pf.line_spacing = signature.get("line_spacing")
+    except Exception:
+        pass
+    run_sig = signature.get("run") or {}
+    for run in getattr(target_paragraph, "runs", []) or []:
+        _apply_run_style_signature(run, run_sig)
+
+def _container_text(container) -> str:
+    try:
+        return _norm_spaces(" ".join([p.text for p in container.paragraphs if (p.text or "").strip()]))
+    except Exception:
+        return ""
+
+def _container_has_images(container) -> bool:
+    try:
+        xml = container._element.xml
+        return ("<w:drawing" in xml) or ("<w:pict" in xml) or ("graphic" in xml and "r:embed" in xml)
+    except Exception:
+        return False
+
+def _extract_header_footer_contract(doc: Document) -> Dict[str, Any]:
+    contract: Dict[str, Any] = {"different_first_page_header_footer": False}
+    try:
+        section = doc.sections[0]
+    except Exception:
+        return contract
+    try:
+        contract["different_first_page_header_footer"] = bool(section.different_first_page_header_footer)
+    except Exception:
+        pass
+    zones = {
+        "first_page_header": getattr(section, "first_page_header", None),
+        "default_header": getattr(section, "header", None),
+        "first_page_footer": getattr(section, "first_page_footer", None),
+        "default_footer": getattr(section, "footer", None),
+    }
+    for name, container in zones.items():
+        if container is None:
+            continue
+        contract[f"{name}_text"] = _container_text(container)
+        contract[f"{name}_has_images"] = _container_has_images(container)
+        try:
+            paras = [p for p in container.paragraphs if (p.text or "").strip()]
+            if paras:
+                contract[f"{name}_style_signature"] = _extract_paragraph_style_signature(paras[0])
+        except Exception:
+            pass
+    footer_text = " ".join([contract.get("first_page_footer_text", ""), contract.get("default_footer_text", "")])
+    footer_xml = ""
+    try:
+        footer_xml = " ".join([
+            getattr(zones.get("first_page_footer"), "_element", None).xml if zones.get("first_page_footer") is not None else "",
+            getattr(zones.get("default_footer"), "_element", None).xml if zones.get("default_footer") is not None else "",
+        ])
+    except Exception:
+        footer_xml = ""
+    contract["footer_page_numbering_detected"] = bool(
+        re.search(r"page\s*\d|page\s*\{?PAGE|NUMPAGES|of\s+\d", footer_text, re.I)
+        or re.search(r"\b(PAGE|NUMPAGES)\b", footer_xml, re.I)
+    )
+    contract["footer_has_word_fields"] = bool(re.search(r"w:fldChar|w:instrText|PAGE|NUMPAGES", footer_xml, re.I))
+    return contract
+
+def _extract_first_page_layout_contract(docx_path: str) -> Dict[str, Any]:
+    """Extract a defensive dictionary-based BS5 first-page layout contract."""
+    contract: Dict[str, Any] = {"available": False, "source_path": docx_path}
+    if not DOCX_AVAILABLE or not docx_path or not os.path.exists(docx_path):
+        return contract
+    try:
+        doc = Document(docx_path)
+        contract.update(_extract_header_footer_contract(doc))
+        contract["available"] = True
+        section = doc.sections[0] if doc.sections else None
+        if section is not None:
+            contract["page_margins"] = {
+                "left_margin_inches": _safe_len_value(section.left_margin),
+                "right_margin_inches": _safe_len_value(section.right_margin),
+                "top_margin_inches": _safe_len_value(section.top_margin),
+                "bottom_margin_inches": _safe_len_value(section.bottom_margin),
+                "header_distance_inches": _safe_len_value(section.header_distance),
+                "footer_distance_inches": _safe_len_value(section.footer_distance),
+            }
+            try:
+                contract["orientation"] = "landscape" if section.orientation and section.orientation.name == "LANDSCAPE" else "portrait"
+            except Exception:
+                pass
+            try:
+                cols = section._sectPr.xpath('./w:cols')
+                if cols:
+                    c = cols[0]
+                    contract["columns"] = {"count": int(c.get(qn('w:num'), 1)), "equal_width": c.get(qn('w:eq')) != "0"}
+            except Exception:
+                pass
+        paras = [p for p in doc.paragraphs[:80] if (p.text or "").strip()]
+        first_page_paras = paras[:25]
+        body_candidates = [p for p in paras if len((p.text or "").strip()) > 40]
+        heading_candidates = [p for p in paras if re.match(r"^\s*(#{0,6}\s*)?(Question|Q)\s*\d+", p.text or "", re.I) or (p.style and "heading" in p.style.name.lower())]
+        if first_page_paras:
+            contract["dominant_first_page_paragraph_style_signature"] = _extract_paragraph_style_signature(first_page_paras[0])
+        if heading_candidates:
+            contract["dominant_question_heading_style_signature"] = _extract_paragraph_style_signature(heading_candidates[0])
+        if body_candidates:
+            contract["dominant_body_style_signature"] = _extract_paragraph_style_signature(body_candidates[0])
+        hf_sigs = [contract.get(k) for k in ("first_page_header_style_signature", "default_header_style_signature", "first_page_footer_style_signature", "default_footer_style_signature") if contract.get(k)]
+        if hf_sigs:
+            contract["dominant_header_footer_style_signature"] = hf_sigs[0]
+    except Exception as e:
+        contract["error"] = str(e)
+    return contract
+
+
 # ======================================================================================
 # DOCX ZIP/XML FALLBACK EXTRACTION HELPERS
 # ======================================================================================
@@ -1243,6 +1476,7 @@ def _build_donor_extraction_debug_report(raw_profile: Dict[str, Any]) -> Dict[st
     tables = raw_profile.get("extracted_tables", []) or []
     text_stats = raw_profile.get("text_stats", {}) or {}
     style = raw_profile.get("style_preferences", {}) or {}
+    first_contract = raw_profile.get("first_page_layout_contract", {}) or {}
 
     return {
         "summary": {
@@ -1282,6 +1516,18 @@ def _build_donor_extraction_debug_report(raw_profile: Dict[str, Any]) -> Dict[st
             }
             for tbl in tables[:20]
         ],
+        "first_page_layout_contract": {
+            "different_first_page_header_footer": bool(first_contract.get("different_first_page_header_footer", False)),
+            "first_page_header_text": first_contract.get("first_page_header_text", ""),
+            "later_page_header_text": first_contract.get("default_header_text", ""),
+            "first_page_footer_text": first_contract.get("first_page_footer_text", ""),
+            "later_page_footer_text": first_contract.get("default_footer_text", ""),
+            "first_page_header_has_images": bool(first_contract.get("first_page_header_has_images", False)),
+            "later_header_has_images": bool(first_contract.get("default_header_has_images", False)),
+            "footer_page_numbering_detected": bool(first_contract.get("footer_page_numbering_detected", False)),
+            "question_heading_style_detected": bool(first_contract.get("dominant_question_heading_style_signature")),
+            "body_style_detected": bool(first_contract.get("dominant_body_style_signature")),
+        },
         "formatting": {
             "font_family": style.get("font_family"),
             "font_size_pt": style.get("font_size_pt"),
@@ -1935,6 +2181,9 @@ def _extract_donor_with_styles(docx_path: str) -> Dict[str, Any]:
         # Extract header/footer with full content
         result["header_footer"] = _extract_header_footer_enhanced(doc, docx_path)
 
+        # Extract BS5 first-page layout/style contract (defensive, partial OK)
+        result["first_page_layout_contract"] = _extract_first_page_layout_contract(docx_path)
+
         # Detect layout features
         result["layout_features"].extend(_detect_layout_features_enhanced(doc))
         
@@ -2245,6 +2494,7 @@ def _extract_donor_fallback(docx_path: str) -> Dict[str, Any]:
     }
 
     raw_profile["header_footer"] = _merge_docx_xml_fallback_into_header_footer(raw_profile.get("header_footer", {}), docx_path)
+    raw_profile["first_page_layout_contract"] = _extract_first_page_layout_contract(docx_path)
     raw_profile["extracted_images"] = _merge_docx_media_fallback_into_images(raw_profile.get("extracted_images", []), docx_path)
     raw_profile["extraction_debug_report"] = _build_donor_extraction_debug_report(raw_profile)
     raw_profile = _strip_subject_baggage_from_donor(raw_profile)
@@ -6908,6 +7158,12 @@ def _normalize_template_profile(raw_profile: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(helper_input.get("style_notes"), list):
         helper_input["style_notes"] = []
 
+    if not isinstance(helper_input.get("first_page_layout_contract"), dict):
+        nested_raw = {}
+        if isinstance(helper_input.get("normalized_profile"), dict):
+            nested_raw = helper_input.get("normalized_profile", {}).get("raw", {}) or {}
+        helper_input["first_page_layout_contract"] = nested_raw.get("first_page_layout_contract", {}) if isinstance(nested_raw.get("first_page_layout_contract"), dict) else {}
+
     # Filter helper-facing list contents so downstream helper functions
     # never receive mixed scalar garbage where they expect dict-like rows.
     helper_input["font_samples"] = [
@@ -7040,6 +7296,7 @@ def _normalize_template_profile(raw_profile: Dict[str, Any]) -> Dict[str, Any]:
     }
 
     style_notes = [str(x).strip() for x in (helper_input.get("style_notes", []) or []) if str(x).strip()]
+    first_page_layout_contract = dict(helper_input.get("first_page_layout_contract", {}) or {})
 
     # --------------------------------------
     # RAW TABLE / IMAGE / PARAGRAPH DEFAULTS
@@ -7225,6 +7482,7 @@ def _normalize_template_profile(raw_profile: Dict[str, Any]) -> Dict[str, Any]:
             "layout_features": layout_features,
             "page_setup": normalized_page_setup,
             "header_footer": header_footer,
+            "first_page_layout_contract": first_page_layout_contract,
             "text_stats": text_stats,
             "interpreted_donor": interpreted_donor,
         },
@@ -7309,6 +7567,7 @@ def _normalize_template_profile(raw_profile: Dict[str, Any]) -> Dict[str, Any]:
         "layout_features": strict_core["features"],
         "page_setup": compatibility_page_setup,
         "header_footer": header_footer,
+        "first_page_layout_contract": first_page_layout_contract,
         "text_stats": text_stats,
         "preview_notes": style_notes,
         "interpreted_donor": interpreted_donor,
@@ -8104,6 +8363,7 @@ def _build_clean_template_md_from_profile(profile: Dict[str, Any]) -> str:
     style = profile.get("style_preferences", {})
     layout_features = profile.get("layout_features", [])
     page_setup = profile.get("page_setup", {})
+    first_contract = profile.get("first_page_layout_contract", {}) or {}
     engine_meta = profile.get("engine_metadata", {})
     
     lines = []
@@ -8162,6 +8422,20 @@ def _build_clean_template_md_from_profile(profile: Dict[str, Any]) -> str:
     columns = page_setup.get("columns", {})
     col_count = columns.get("count", 1)
     lines.append(f"- **Columns:** {col_count} column{'s' if col_count > 1 else ''}")
+    lines.append("")
+
+    # First-page layout contract
+    lines.append("## First Page Layout Contract")
+    lines.append(f"- **Different first-page header/footer:** {str(bool(first_contract.get('different_first_page_header_footer', False))).lower()}")
+    lines.append(f"- **First-page header text:** {_short(first_contract.get('first_page_header_text', ''), 120) or 'Not detected'}")
+    lines.append(f"- **Later-page header text:** {_short(first_contract.get('default_header_text', ''), 120) or 'Not detected'}")
+    lines.append(f"- **First-page footer text:** {_short(first_contract.get('first_page_footer_text', ''), 120) or 'Not detected'}")
+    lines.append(f"- **Later-page footer text:** {_short(first_contract.get('default_footer_text', ''), 120) or 'Not detected'}")
+    lines.append(f"- **First-page header has images:** {str(bool(first_contract.get('first_page_header_has_images', False))).lower()}")
+    lines.append(f"- **Later header has images:** {str(bool(first_contract.get('default_header_has_images', False))).lower()}")
+    lines.append(f"- **Footer page numbering detected:** {str(bool(first_contract.get('footer_page_numbering_detected', False))).lower()}")
+    lines.append(f"- **Question heading style detected:** {str(bool(first_contract.get('dominant_question_heading_style_signature'))).lower()}")
+    lines.append(f"- **Body style detected:** {str(bool(first_contract.get('dominant_body_style_signature'))).lower()}")
     lines.append("")
     
     # Layout features with classification
@@ -11799,7 +12073,7 @@ def render_blueprint_to_markdown(blueprint: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any]) -> None:
+def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any], first_page_contract: Optional[Dict[str, Any]] = None) -> None:
     """
     Render BS5 institutional front matter from the composed blueprint only.
 
@@ -11817,6 +12091,8 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any]) -> No
     title_block = blueprint.get("title_block", {}) or {}
     instruction_block = blueprint.get("instruction_block", {}) or {}
     logo_candidate = blueprint.get("logo_candidate") or {}
+    first_page_contract = first_page_contract or {}
+    logo_candidate = logo_candidate or {}
 
     institution_name = str(identity_block.get("institution_name", "") or "").strip()
     field_lines = list(identity_block.get("field_lines", []) or [])
@@ -11837,13 +12113,29 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any]) -> No
     # --------------------------------------------------
     # 0. Page-one institutional logo
     # --------------------------------------------------
-    if isinstance(logo_candidate, dict) and logo_candidate.get("binary_data"):
+    # If the donor stores its page-one logo in the first-page header, the
+    # header/footer renderer owns it. Do not also centre it in body front matter.
+    contract_first_header_has_logo = bool(first_page_contract.get("first_page_header_has_images", False))
+    logo_position_hint = str(logo_candidate.get("position", "") if isinstance(logo_candidate, dict) else "").strip().lower()
+    render_body_logo = bool(
+        isinstance(logo_candidate, dict)
+        and logo_candidate.get("binary_data")
+        and not contract_first_header_has_logo
+        and logo_position_hint not in {"header", "first_page_header"}
+    )
+
+    if render_body_logo:
         try:
             from docx.shared import Inches
             from io import BytesIO
 
             logo_para = doc.add_paragraph()
-            logo_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            logo_alignment_name = str(
+                (first_page_contract.get("dominant_first_page_paragraph_style_signature", {}) or {}).get("alignment")
+                or logo_candidate.get("alignment")
+                or "CENTER"
+            ).upper()
+            logo_para.alignment = getattr(WD_ALIGN_PARAGRAPH, logo_alignment_name, WD_ALIGN_PARAGRAPH.CENTER)
 
             logo_width = float(logo_candidate.get("width_inches", 1.25) or 1.25)
             logo_width = max(0.5, min(logo_width, 1.5))
@@ -11939,14 +12231,19 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any]) -> No
     # --------------------------------------------------
     if title:
         title_para = doc.add_paragraph()
-        title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        title_signature = first_page_contract.get("dominant_first_page_paragraph_style_signature") or {}
+        title_alignment_name = str(title_signature.get("alignment") or "CENTER").upper()
+        title_para.alignment = getattr(WD_ALIGN_PARAGRAPH, title_alignment_name, WD_ALIGN_PARAGRAPH.CENTER)
         title_run = title_para.add_run(title)
-        title_run.bold = True
-        try:
-            from docx.shared import Pt
-            title_run.font.size = Pt(16)
-        except Exception:
-            pass
+        if title_signature:
+            _apply_paragraph_style_signature(title_para, title_signature)
+        else:
+            title_run.bold = True
+            try:
+                from docx.shared import Pt
+                title_run.font.size = Pt(16)
+            except Exception:
+                pass
 
     meta_parts = []
     if year_level:
@@ -12074,13 +12371,15 @@ def render_blueprint_to_docx(blueprint: Dict[str, Any], template_profile: Dict[s
         doc,
         header_block,
         blueprint.get("title", ""),
-        datetime.now().strftime("%Y-%m-%d")
+        datetime.now().strftime("%Y-%m-%d"),
+        template_profile.get("first_page_layout_contract", {}) or {},
+        blueprint.get("logo_candidate") or {}
     )
 
     # --------------------------------------------------
     # BS5 institutional front matter
     # --------------------------------------------------
-    _render_bs5_institutional_front_matter(doc, blueprint)
+    _render_bs5_institutional_front_matter(doc, blueprint, template_profile.get("first_page_layout_contract", {}) or {})
 
     title = blueprint.get("title", "Untitled Document")
 
@@ -12149,6 +12448,10 @@ def render_blueprint_to_docx(blueprint: Dict[str, Any], template_profile: Dict[s
     # --------------------------------------------------
     # Questions
     # --------------------------------------------------
+    first_page_contract = template_profile.get("first_page_layout_contract", {}) or {}
+    donor_question_heading_signature = first_page_contract.get("dominant_question_heading_style_signature") or {}
+    donor_body_signature = first_page_contract.get("dominant_body_style_signature") or {}
+
     question_blocks = blueprint.get("question_blocks", []) or []
     for q in question_blocks:
         q_no = str(q.get("q_no", "?")).strip() or "?"
@@ -12163,7 +12466,10 @@ def render_blueprint_to_docx(blueprint: Dict[str, Any], template_profile: Dict[s
             heading += f" {marks_label}"
 
         q_para = doc.add_paragraph(heading)
-        q_para.style = doc.styles["Heading 2"]
+        if donor_question_heading_signature:
+            _apply_paragraph_style_signature(q_para, donor_question_heading_signature)
+        else:
+            q_para.style = doc.styles["Heading 2"]
 
         for line in q.get("question_lines", []) or []:
             clean_line = str(line).strip()
@@ -12173,7 +12479,9 @@ def render_blueprint_to_docx(blueprint: Dict[str, Any], template_profile: Dict[s
             if q_no.lower().startswith("step ") and re.match(r"^\d+\.\s+", clean_line):
                 doc.add_paragraph(clean_line, style="List Number")
             else:
-                doc.add_paragraph(clean_line)
+                body_para = doc.add_paragraph(clean_line)
+                if donor_body_signature:
+                    _apply_paragraph_style_signature(body_para, donor_body_signature)
 
         if q.get("question_lines"):
             doc.add_paragraph()
@@ -12196,12 +12504,18 @@ def render_blueprint_to_docx(blueprint: Dict[str, Any], template_profile: Dict[s
                     first = body_lines[0].strip()
                     rest = [ln.rstrip() for ln in body_lines[1:]]
 
-                    doc.add_paragraph(f"({label}) {first}")
+                    body_para = doc.add_paragraph(f"({label}) {first}")
+                    if donor_body_signature:
+                        _apply_paragraph_style_signature(body_para, donor_body_signature)
                     for ln in rest:
                         if ln.strip():
-                            doc.add_paragraph(ln.strip())
+                            body_para = doc.add_paragraph(ln.strip())
+                            if donor_body_signature:
+                                _apply_paragraph_style_signature(body_para, donor_body_signature)
                 else:
-                    doc.add_paragraph(f"({label})")
+                    body_para = doc.add_paragraph(f"({label})")
+                    if donor_body_signature:
+                        _apply_paragraph_style_signature(body_para, donor_body_signature)
 
                 subpart_plan = sp.get("answer_space_plan", {}) or {}
                 if subpart_plan:
@@ -12393,7 +12707,9 @@ def _preserve_header_footer_structure(
     output_doc,
     header_block: Dict[str, Any],
     draft_title: str,
-    draft_date: str
+    draft_date: str,
+    first_page_contract: Optional[Dict[str, Any]] = None,
+    logo_candidate: Optional[Dict[str, Any]] = None
 ) -> None:
     """
     Apply BS5-composed running header/footer structure.
@@ -12412,12 +12728,14 @@ def _preserve_header_footer_structure(
     from docx.oxml.ns import qn
 
     section = output_doc.sections[0]
+    first_page_contract = first_page_contract or {}
+    logo_candidate = logo_candidate or {}
 
     # --------------------------------------------------
     # Always separate and clear header/footer containers first
     # so stale content can never survive when show_header=False
     # --------------------------------------------------
-    section.different_first_page_header_footer = True
+    section.different_first_page_header_footer = bool(first_page_contract.get("different_first_page_header_footer", True))
 
     header = section.header
     first_header = section.first_page_header
@@ -12435,6 +12753,34 @@ def _preserve_header_footer_structure(
     _clear_container(first_header)
     _clear_container(footer)
     _clear_container(first_footer)
+
+    def _add_logo_to_container(container, style_sig=None) -> bool:
+        if not isinstance(logo_candidate, dict) or not logo_candidate.get("binary_data"):
+            return False
+        try:
+            from docx.shared import Inches
+            from io import BytesIO
+
+            para = container.paragraphs[0] if container.paragraphs else container.add_paragraph()
+            para.clear()
+            _apply_paragraph_style_signature(para, style_sig or {})
+
+            width = float(logo_candidate.get("width_inches", 1.25) or 1.25)
+            width = max(0.5, min(width, 2.0))
+            para.add_run().add_picture(BytesIO(logo_candidate.get("binary_data")), width=Inches(width))
+            return True
+        except Exception as e:
+            logger.warning(f"Could not restore contract header/footer logo: {e}")
+            return False
+
+    # Do not rewrite donor header/footer text as plain text: that can flatten fields,
+    # tables, drawings, and old pagination. Use the contract as layout evidence only.
+    wrote_donor_default_header = False
+    wrote_donor_first_header = False
+    if bool(first_page_contract.get("default_header_has_images", False)):
+        wrote_donor_default_header = _add_logo_to_container(header, first_page_contract.get("default_header_style_signature"))
+    if section.different_first_page_header_footer and bool(first_page_contract.get("first_page_header_has_images", False)):
+        wrote_donor_first_header = _add_logo_to_container(first_header, first_page_contract.get("first_page_header_style_signature"))
 
     if not isinstance(header_block, dict):
         return
@@ -12491,7 +12837,7 @@ def _preserve_header_footer_structure(
             continue
         safe_running_lines.append(line)
 
-    wrote_any = False
+    wrote_any = bool(wrote_donor_default_header)
 
     header_pattern = header_block.get("header_pattern", {}) or {}
     pattern_confidence = float(header_pattern.get("confidence", 0.0) or 0.0)
@@ -12631,7 +12977,7 @@ def _preserve_header_footer_structure(
 
     first_page_labels = header_block.get("first_page_header_labels", []) or []
 
-    wrote_first = False
+    wrote_first = bool(wrote_donor_first_header)
 
     for idx, text in enumerate(first_page_labels[:2]):
         s = str(text or "").strip()
@@ -12659,7 +13005,8 @@ def _preserve_header_footer_structure(
     # --------------------------------------------------
     # Running footer (pages after first) - page numbering
     # --------------------------------------------------
-    footer_para = footer.add_paragraph()
+    footer_para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+    footer_para.clear()
     footer_para.alignment = running_footer_alignment
 
     def _append_complex_field(paragraph, field_name: str, placeholder_text: str = "1"):
@@ -12694,6 +13041,9 @@ def _preserve_header_footer_structure(
         fld_char_end.set(qn("w:fldCharType"), "end")
         run_end._r.append(fld_char_end)
 
+    # Always render dynamic fields for page numbering. If the donor had page
+    # numbering, this preserves dynamic PAGE/NUMPAGES semantics; if not, this
+    # keeps the existing BS5 running-footer behaviour.
     footer_para.add_run("Page ")
     _append_complex_field(footer_para, " PAGE ", "1")
     footer_para.add_run(" of ")
@@ -14344,3 +14694,66 @@ if __name__ == "__main__":
     print("✅ All basic helper tests passed!")
 
 
+
+
+def diagnose_first_page_layout_contract(donor_docx_path: str, output_docx_path: Optional[str] = None) -> Dict[str, Any]:
+    """
+    Lightweight Colab/manual diagnostic for BS5 first-page layout contract support.
+
+    Loads a donor DOCX, prints its first-page contract, renders a tiny draft-like
+    blueprint through the normal renderer, saves the output DOCX, and returns
+    simple pass/fail checks. No external services are required.
+    """
+    if not DOCX_AVAILABLE:
+        raise RuntimeError("python-docx is required for this diagnostic")
+
+    raw_profile = _extract_donor_with_styles(donor_docx_path)
+    profile = _normalize_template_profile(raw_profile)
+    contract = profile.get("first_page_layout_contract", {}) or {}
+
+    print("## First Page Layout Contract")
+    print(json.dumps(contract, indent=2, default=str))
+
+    blueprint = {
+        "title": "First Page Contract Diagnostic",
+        "page_setup": profile.get("page_setup", {}),
+        "appropriateness_decisions": {},
+        "header_block": {"show_header": True, "header_lines": profile.get("header_footer", {}).get("header_texts", [])},
+        "question_blocks": [
+            {"q_no": "1", "marks_label": "(2 marks)", "question_lines": ["This is a diagnostic question."], "marks_value": 2}
+        ],
+        "visual_slots": [],
+        "page_breaks": [],
+    }
+
+    rendered_path = render_blueprint_to_docx(blueprint, profile)
+    if output_docx_path:
+        import shutil
+        shutil.copyfile(rendered_path, output_docx_path)
+        rendered_path = output_docx_path
+
+    rendered_doc = Document(rendered_path)
+    rendered_section = rendered_doc.sections[0]
+    donor_diff = bool(contract.get("different_first_page_header_footer", False))
+    out_diff = bool(getattr(rendered_section, "different_first_page_header_footer", False))
+    out_first_header = _container_text(rendered_section.first_page_header)
+    out_default_header = _container_text(rendered_section.header)
+
+    checks = {
+        "output_path": rendered_path,
+        "same_different_first_page_header_footer": out_diff == donor_diff,
+        "first_page_header_not_duplicated_into_default_unless_donor_did": (
+            not contract.get("first_page_header_text")
+            or contract.get("first_page_header_text") == contract.get("default_header_text")
+            or contract.get("first_page_header_text") not in out_default_header
+        ),
+        "default_header_remains_present_when_donor_had_one": (
+            not contract.get("default_header_text") or bool(out_default_header)
+        ),
+        "question_heading_style_signature_detected": bool(contract.get("dominant_question_heading_style_signature")),
+        "output_first_page_header_text": out_first_header,
+        "output_default_header_text": out_default_header,
+    }
+    print("## Diagnostic Checks")
+    print(json.dumps(checks, indent=2, default=str))
+    return {"contract": contract, "checks": checks}
