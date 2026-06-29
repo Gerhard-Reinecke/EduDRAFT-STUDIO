@@ -8513,7 +8513,7 @@ with gr.Blocks(title="EduDRAFT STUDIO", css=CUSTOM_CSS) as demo:
     )
 
 
-port = int(os.getenv("PORT", os.getenv("GRADIO_SERVER_PORT", "7860")))
+port = int(os.getenv("PORT", os.getenv("GRADIO_SERVER_PORT", "10000")))
 
 print(f"Launching Gradio on port {port}")
 
@@ -8521,7 +8521,8 @@ demo.launch(
     server_name="0.0.0.0",
     server_port=port,
     share=False,
-    prevent_thread_lock=False
+    prevent_thread_lock=False,
+    show_error=True
 )
 
 
