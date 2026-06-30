@@ -1134,12 +1134,90 @@ def _extract_first_page_layout_contract(docx_path: str) -> Dict[str, Any]:
                     contract["columns"] = {"count": int(c.get(qn('w:num'), 1)), "equal_width": c.get(qn('w:eq')) != "0"}
             except Exception:
                 pass
-        paras = [p for p in doc.paragraphs[:80] if (p.text or "").strip()]
-        first_page_paras = paras[:25]
-        body_candidates = [p for p in paras if len((p.text or "").strip()) > 40]
-        heading_candidates = [p for p in paras if re.match(r"^\s*(#{0,6}\s*)?(Question|Q)\s*\d+", p.text or "", re.I) or (p.style and "heading" in p.style.name.lower())]
-        if first_page_paras:
-            contract["dominant_first_page_paragraph_style_signature"] = _extract_paragraph_style_signature(first_page_paras[0])
+        # Role-aware first-page style signatures. Do not treat the first
+        # non-empty paragraph as a dominant first-page style: page-one labels
+        # such as OFFICIAL are common and must not style the generated title.
+        all_first_page_paras = list(doc.paragraphs[:60])
+        indexed_first_page_paras = list(enumerate(all_first_page_paras))
+        indexed_text_first_page_paras = [(idx, p) for idx, p in indexed_first_page_paras if (p.text or "").strip()]
+        text_first_page_paras = [p for _, p in indexed_text_first_page_paras]
+
+        def _para_text(p) -> str:
+            return (getattr(p, "text", "") or "").replace("\xa0", " ").strip()
+
+        def _style_name(p) -> str:
+            try:
+                return (p.style.name if p.style else "") or ""
+            except Exception:
+                return ""
+
+        def _has_body_drawing(p) -> bool:
+            try:
+                xml = p._p.xml
+                return "<w:drawing" in xml or "<w:pict" in xml or ("graphic" in xml and "r:embed" in xml)
+            except Exception:
+                return False
+
+        def _is_label_text(text: str) -> bool:
+            s = (text or "").strip()
+            return bool(
+                s
+                and len(s) <= 30
+                and re.fullmatch(r"[A-Z][A-Z\s.-]{2,}", s)
+                and re.search(r"\b(OFFICIAL|DRAFT|CONFIDENTIAL|COPY|SAMPLE)\b", s, re.I)
+            )
+
+        def _is_admin_field_text(text: str) -> bool:
+            return bool(re.match(r"^\s*(name|teacher|student|class|date|year|subject|candidate|room|period)\s*[:_\-.]", text or "", re.I))
+
+        def _is_title_candidate(p, idx: int) -> bool:
+            text = _para_text(p)
+            if not text or _is_label_text(text) or _is_admin_field_text(text):
+                return False
+            low = text.lower()
+            style_low = _style_name(p).lower()
+            if re.match(r"^\s*(question|q)\s*\d+", text, re.I):
+                return False
+            if len(text) > 140:
+                return False
+            if "title" in style_low or "heading" in style_low:
+                return True
+            title_terms = ("assessment", "worksheet", "examination", "exam", "test", "booklet", "task")
+            if any(term in low for term in title_terms) and idx <= 30:
+                return True
+            # Nearby body-logo evidence can identify a real title block, but
+            # only for non-label/non-field text with enough substance.
+            if any(abs(idx - logo_idx) <= 3 for logo_idx in logo_body_indices):
+                return 8 <= len(text) <= 90 and len(text.split()) >= 2
+            # Conservative fallback: a substantial early non-field/non-label line.
+            return idx <= 20 and 8 <= len(text) <= 90 and len(text.split()) >= 2
+
+        logo_body_pairs = [(idx, p) for idx, p in indexed_first_page_paras if _has_body_drawing(p)]
+        logo_body_indices = [idx for idx, _ in logo_body_pairs]
+        logo_body_candidates = [p for _, p in logo_body_pairs]
+        label_candidates = [p for _, p in indexed_text_first_page_paras if _is_label_text(_para_text(p))]
+        admin_field_candidates = [p for _, p in indexed_text_first_page_paras if _is_admin_field_text(_para_text(p))]
+        title_candidates = [
+            p for idx, p in indexed_text_first_page_paras
+            if _is_title_candidate(p, idx)
+        ]
+
+        if logo_body_candidates:
+            contract["first_page_logo_body_style_signature"] = _extract_paragraph_style_signature(logo_body_candidates[0])
+        if title_candidates:
+            contract["first_page_title_style_signature"] = _extract_paragraph_style_signature(title_candidates[0])
+        if admin_field_candidates:
+            contract["first_page_admin_field_style_signature"] = _extract_paragraph_style_signature(admin_field_candidates[0])
+        if label_candidates:
+            contract["first_page_label_style_signature"] = _extract_paragraph_style_signature(label_candidates[0])
+
+        # Backward-compatible key remains, but it is now title-led rather than
+        # first-non-empty-led to avoid OFFICIAL/admin labels controlling titles.
+        if contract.get("first_page_title_style_signature"):
+            contract["dominant_first_page_paragraph_style_signature"] = contract["first_page_title_style_signature"]
+
+        body_candidates = [p for p in text_first_page_paras if len(_para_text(p)) > 40 and not _is_label_text(_para_text(p)) and not _is_admin_field_text(_para_text(p))]
+        heading_candidates = [p for p in text_first_page_paras if re.match(r"^\s*(#{0,6}\s*)?(Question|Q)\s*\d+", p.text or "", re.I) or (p.style and "heading" in p.style.name.lower())]
         if heading_candidates:
             contract["dominant_question_heading_style_signature"] = _extract_paragraph_style_signature(heading_candidates[0])
         if body_candidates:
@@ -12109,6 +12187,10 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any], first
         identity_block.get("logo_present", False)
         or (isinstance(logo_candidate, dict) and bool(logo_candidate.get("binary_data")))
     )
+    logo_body_signature = first_page_contract.get("first_page_logo_body_style_signature") or {}
+    title_signature = first_page_contract.get("first_page_title_style_signature") or {}
+    admin_field_signature = first_page_contract.get("first_page_admin_field_style_signature") or {}
+    label_signature = first_page_contract.get("first_page_label_style_signature") or {}
 
     # --------------------------------------------------
     # 0. Page-one institutional logo
@@ -12131,7 +12213,7 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any], first
 
             logo_para = doc.add_paragraph()
             logo_alignment_name = str(
-                (first_page_contract.get("dominant_first_page_paragraph_style_signature", {}) or {}).get("alignment")
+                logo_body_signature.get("alignment")
                 or logo_candidate.get("alignment")
                 or "CENTER"
             ).upper()
@@ -12192,10 +12274,21 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any], first
 
     identity_lines = _dedupe_keep_order(identity_lines)
 
+    def _is_front_matter_label(text: str) -> bool:
+        s = str(text or "").strip()
+        return bool(
+            re.fullmatch(r"[A-Z][A-Z\s.-]{2,}", s)
+            and re.search(r"\b(OFFICIAL|DRAFT|CONFIDENTIAL|COPY|SAMPLE)\b", s, re.I)
+        )
+
     for idx, line in enumerate(identity_lines[:6]):
         para = doc.add_paragraph()
         para.alignment = WD_ALIGN_PARAGRAPH.CENTER
         run = para.add_run(line)
+
+        if _is_front_matter_label(line) and label_signature:
+            _apply_paragraph_style_signature(para, label_signature)
+            continue
 
         if idx == 0:
             run.bold = True
@@ -12221,7 +12314,9 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any], first
     # --------------------------------------------------
     cleaned_fields = _dedupe_keep_order(field_lines)
     for line in cleaned_fields[:6]:
-        doc.add_paragraph(line)
+        field_para = doc.add_paragraph(line)
+        if admin_field_signature:
+            _apply_paragraph_style_signature(field_para, admin_field_signature)
 
     if cleaned_fields:
         doc.add_paragraph()
@@ -12231,7 +12326,6 @@ def _render_bs5_institutional_front_matter(doc, blueprint: Dict[str, Any], first
     # --------------------------------------------------
     if title:
         title_para = doc.add_paragraph()
-        title_signature = first_page_contract.get("dominant_first_page_paragraph_style_signature") or {}
         title_alignment_name = str(title_signature.get("alignment") or "CENTER").upper()
         title_para.alignment = getattr(WD_ALIGN_PARAGRAPH, title_alignment_name, WD_ALIGN_PARAGRAPH.CENTER)
         title_run = title_para.add_run(title)
